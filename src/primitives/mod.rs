@@ -2,6 +2,7 @@
 mod helpers;
 mod iappdomain;
 mod iassembly;
+mod iclrassemblyidentitymanager;
 mod iclrmetahost;
 mod iclrruntimehost;
 mod iclrruntimeinfo;
@@ -18,6 +19,7 @@ mod types;
 pub use helpers::*;
 pub use iappdomain::*;
 pub use iassembly::*;
+pub use iclrassemblyidentitymanager::*;
 pub use iclrmetahost::*;
 pub use iclrruntimehost::*;
 pub use iclrruntimeinfo::*;
