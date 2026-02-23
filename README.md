@@ -161,7 +161,7 @@ fn main() -> Result<(), String> {
 
 You can use the building blocks provided by `ClrOxide` to patch `System.Environment.Exit` as described in [Massaging your CLR: Preventing Environment.Exit in In-Process .NET Assemblies](https://www.mdsec.co.uk/2020/08/massaging-your-clr-preventing-environment-exit-in-in-process-net-assemblies) by MDSec.  
 
-You can check the reference implementation at [`examples/patch_exit.rs`](examples/patch_exit.rs). Since this requires using `VirtualProtect` or `NtProtectVirtualMemory`, I don't intend to add this as a feature to `ClrOxide`. 
+You can check the reference implementation at [`examples/patch_exit.rs`](examples/patch_exit.rs). Since this requires using `VirtualProtect` or `NtProtectVirtualMemory`, I don't intend to add this as a feature to `ClrOxide`.
 
 ---
 
@@ -282,4 +282,4 @@ let identity = clr.get_assembly_identity()?;
 ### References
 
 - [Being-A-Good-CLR-Host](https://github.com/xforcered/Being-A-Good-CLR-Host) - Original C implementation
-- [Customizing the Microsoft .NET Framework Common Language Runtime](https://www.amazon.com/Customizing-Microsoft-Framework-Common-Language/dp/0735619883) by Steven Pratschner
+- [Customizing the Microsoft .NET Framework Common Language Runtime](https://www.amazon.com/Customizing-Microsoft-Framework-Common-Language/dp/0735619883) by Steven Pratschner 
