@@ -164,25 +164,25 @@ You can check the reference implementation at [`examples/patch_exit.rs`](example
 
 ---  
 
-1. primitives/iclrruntimehost.rs (nouveau)
-Interface ICLRRuntimeHost avec SetHostControl pour enregistrer notre host custom.
+1. primitives/iclrruntimehost.rs (nouveau)  
+Interface ICLRRuntimeHost avec SetHostControl pour enregistrer notre host custom.  
 
-2. primitives/ihostassemblystore.rs (nouveau)
-Contient toute la magie :
-IHostControl - Le CLR appelle GetHostManager
-IHostAssemblyManager - Retourne notre IHostAssemblyStore
-IHostAssemblyStore - ProvideAssembly retourne un IStream avec les bytes en mémoire
-MemoryStream - Implémentation IStream pour les bytes en mémoire
-AmsiBypassLoader - API haut niveau pour gérer le bypass
+2. primitives/ihostassemblystore.rs (nouveau)  
+Contient toute la magie :  
+IHostControl - Le CLR appelle GetHostManager  
+IHostAssemblyManager - Retourne notre IHostAssemblyStore  
+IHostAssemblyStore - ProvideAssembly retourne un IStream avec les bytes en mémoire  
+MemoryStream - Implémentation IStream pour les bytes en mémoire  
+AmsiBypassLoader - API haut niveau pour gérer le bypass  
 
 3. clr/mod.rs (modifié)
 Ajout de :
-get_context_with_amsi_bypass() - Initialise le CLR avec le bypass
-run_with_amsi_bypass() - Exécute une assembly sans scan AMSI
-run_with_amsi_bypass_no_redirect() - Idem sans redirection output
+get_context_with_amsi_bypass() - Initialise le CLR avec le bypass  
+run_with_amsi_bypass() - Exécute une assembly sans scan AMSI  
+run_with_amsi_bypass_no_redirect() - Idem sans redirection output  
 
-Exemple d'utilisation
-```
+Exemple d'utilisation    
+```rust
 use clroxide::clr::Clr;
 use clroxide::primitives::AmsiBypassLoader;
 
@@ -206,8 +206,8 @@ fn main() -> Result<(), String> {
 }
 ```
 
-Comment ça marche
-```
+Comment ça marche  
+```rust
 use clroxide::clr::Clr;
 use clroxide::primitives::AmsiBypassLoader;
 
