@@ -1,5 +1,6 @@
 use crate::primitives::{
-    Class, ICorRuntimeHost, IUnknown, IUnknownVtbl, Interface, BOOL, GUID, HANDLE, HRESULT,
+    Class, ICLRRuntimeHost, ICorRuntimeHost, IUnknown, IUnknownVtbl, Interface, BOOL, GUID,
+    HANDLE, HRESULT,
 };
 use std::{ffi::c_void, fmt::Display, ops::Deref, ptr};
 use windows::core::{BSTR, PWSTR};
@@ -132,6 +133,30 @@ impl ICLRRuntimeInfo {
         }
 
         return Ok(ppv);
+    }
+
+    /// Get ICLRRuntimeHost - this is the interface that supports SetHostControl
+    /// for AMSI bypass via custom IHostAssemblyStore
+    pub fn get_clr_runtime_host(&self) -> Result<*mut ICLRRuntimeHost, String> {
+        let mut ppv: *mut ICLRRuntimeHost = ptr::null_mut();
+
+        let hr = unsafe {
+            (*self).GetInterface(
+                &ICLRRuntimeHost::CLSID,
+                &ICLRRuntimeHost::IID,
+                &mut ppv as *mut *mut _ as *mut *mut c_void,
+            )
+        };
+
+        if hr.is_err() {
+            return Err(format!("Could not retrieve ICLRRuntimeHost: {:?}", hr));
+        }
+
+        if ppv.is_null() {
+            return Err("Could not retrieve ICLRRuntimeHost".into());
+        }
+
+        Ok(ppv)
     }
 
     pub fn get_version(&self) -> Result<RuntimeVersion, String> {

