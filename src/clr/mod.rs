@@ -333,15 +333,29 @@ impl Clr {
         // Get ICLRRuntimeHost (not ICorRuntimeHost) - this has SetHostControl
         let clr_runtime_host = unsafe { (*runtime_info).get_clr_runtime_host()? };
 
-        // Create and set our custom host control BEFORE starting the runtime
-        let host_control = bypass_loader.create_host_control();
-        unsafe { (*clr_runtime_host).set_host_control(host_control)? };
+        // Check if the CLR runtime was already started by a previous assembly execution
+        // in this process. SetHostControl MUST be called before Start(), so if the
+        // runtime is already running (e.g. second execute-assembly call) we skip it.
+        // E_ACCESSDENIED (0x80070005) is returned if we call SetHostControl after Start().
+        let already_started = unsafe { (*runtime_info).has_started().unwrap_or(false) };
 
-        // Now start the runtime
-        unsafe {
-            if (*runtime_info).can_be_loaded()? && !(*runtime_info).has_started()? {
-                (*clr_runtime_host).start()?;
-            }
+        let registered_clr_host = if !already_started {
+            // Runtime not yet started: register our IHostAssemblyStore for AMSI bypass
+            let host_control = bypass_loader.create_host_control();
+            unsafe { (*clr_runtime_host).set_host_control(host_control)? };
+
+            unsafe {
+                if (*runtime_info).can_be_loaded()? {
+                    (*clr_runtime_host).start()?;
+                }
+            };
+
+            Some(clr_runtime_host)
+        } else {
+            // Runtime already running — SetHostControl would fail with E_ACCESSDENIED.
+            // Fall back: AMSI bypass is not applied for this execution, but at least
+            // we can still load and run the assembly via the existing AppDomain.
+            None
         };
 
         // Get the legacy runtime host for AppDomain access
@@ -353,7 +367,7 @@ impl Clr {
             host,
             runtime_info,
             runtime_host,
-            clr_runtime_host: Some(clr_runtime_host),
+            clr_runtime_host: registered_clr_host,
             app_domain,
         });
 
