@@ -267,11 +267,15 @@ pub fn get_assembly_identity_from_bytes(data: &[u8]) -> Result<String, String> {
     let ci_has_constant = coded_idx_size(&[0x04, 0x08, 0x17], 2); // HasConstant
     let ci_has_cattr = coded_idx_size(
         &[
-            0x00, 0x01, 0x02, 0x04, 0x06, 0x08, 0x09, 0x0A, 0x0C, 0x0D, 0x0E, 0x11, 0x14, 0x17,
-            0x19, 0x1A, 0x1B, 0x1C,
+            0x06, 0x04, 0x01, 0x02, 0x08, 0x09, 0x0A,
+            0x00, // MethodDef, Field, TypeRef, TypeDef, Param, InterfaceImpl, MemberRef, Module
+            0x0E, 0x17, 0x14, 0x11, 0x1A,
+            0x1B, // DeclSecurity, Property, Event, StandAloneSig, ModuleRef, TypeSpec
+            0x20, 0x23, 0x26, 0x27, 0x28, 0x2A, 0x2C,
+            0x2B, // Assembly, AssemblyRef, File, ExportedType, ManifestResource, GenericParam, GenericParamConstraint, MethodSpec
         ],
         5,
-    ); // HasCustomAttribute
+    );
     let ci_has_field_marshal = coded_idx_size(&[0x04, 0x08], 1);
     let ci_has_decl_security = coded_idx_size(&[0x02, 0x06, 0x20], 2);
     let ci_member_ref_parent = coded_idx_size(&[0x00, 0x01, 0x1A, 0x06, 0x1B], 3);
@@ -279,14 +283,7 @@ pub fn get_assembly_identity_from_bytes(data: &[u8]) -> Result<String, String> {
     let ci_method_def_or_ref = coded_idx_size(&[0x06, 0x0A], 1);
     let ci_member_forwarded = coded_idx_size(&[0x04, 0x06], 1);
     let ci_implementation = coded_idx_size(&[0x26, 0x23, 0x27], 2);
-    let ci_cattr_type = coded_idx_size(
-        &[
-            0x00, /*unused*/
-            0x00, /*unused*/
-            0x06, 0x0A, 0x00, /*unused*/
-        ],
-        3,
-    );
+    let ci_cattr_type = coded_idx_size(&[0x06, 0x0A], 3); // CustomAttributeType: MethodDef or MemberRef only
     let ci_resolution_scope = coded_idx_size(&[0x00, 0x1A, 0x23, 0x01], 2);
     let ci_type_or_method_def = coded_idx_size(&[0x02, 0x06], 1);
 
@@ -306,7 +303,8 @@ pub fn get_assembly_identity_from_bytes(data: &[u8]) -> Result<String, String> {
         /* 0x08 Param             */ 2 + 2 + string_idx_size,
         /* 0x09 InterfaceImpl     */ tbl_idx(0x02) + ci_type_def_or_ref,
         /* 0x0A MemberRef         */ ci_member_ref_parent + string_idx_size + blob_idx_size,
-        /* 0x0B Constant          */ 2 + 2 + ci_has_constant + blob_idx_size,
+        /* 0x0B Constant          */
+        2 + ci_has_constant + blob_idx_size, // Type(1)+Pad(1), Parent, Value
         /* 0x0C CustomAttribute   */ ci_has_cattr + ci_cattr_type + blob_idx_size,
         /* 0x0D FieldMarshal      */ ci_has_field_marshal + blob_idx_size,
         /* 0x0E DeclSecurity      */ 2 + ci_has_decl_security + blob_idx_size,
@@ -398,6 +396,24 @@ pub fn get_assembly_identity_from_bytes(data: &[u8]) -> Result<String, String> {
     // If PublicKey blob is empty (index points to 0-size blob) → "null"
     // Otherwise compute SHA1 of key, take last 8 bytes reversed → hex token
     let public_key_token = get_public_key_token(blob, pk_blob_idx);
+
+    // --- Sanity check: validate the parsed result ---
+    // If version numbers are garbage (> 65534 is impossible for real assemblies),
+    // or the name contains non-printable chars, return a diagnostic error.
+    if name.is_empty() || name_str_idx >= strings.len() {
+        return Err(format!(
+            "PE identity parse failed: name index {} is out of range (offset={}). \
+             Assembly table row may be at wrong offset - check table row size calculations.",
+            name_str_idx, row_off
+        ));
+    }
+    if name.contains('\0') || name.chars().any(|c| c < ' ' && c != '\t') {
+        return Err(format!(
+            "PE identity parse failed: assembly name {:?} contains invalid characters. \
+             Table offset calculation may be wrong.",
+            name
+        ));
+    }
 
     let identity = format!(
         "{}, Version={}.{}.{}.{}, Culture={}, PublicKeyToken={}",
