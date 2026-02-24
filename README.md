@@ -1,6 +1,5 @@
 # ClrOxide (fork)
-
-Fork de [clroxide](https://github.com/b4rtik/clroxide), une bibliothèque Rust permettant d'héberger le CLR .NET et d'exécuter dynamiquement des assemblies .NET en mémoire.
+Fork de [clroxide](https://github.com/yamakadi/clroxide), une bibliothèque Rust permettant d'héberger le CLR .NET et d'exécuter dynamiquement des assemblies .NET en mémoire.
 
 ---
 
@@ -103,6 +102,6 @@ println!("{}", output);
 
 ## Références
 
-- [Being a Good CLR Host — xforcered](https://github.com/xforcered/Being-A-Good-CLR-Host)
+- [Being a Good CLR Host — xforcered](https://www.ibm.com/think/x-force/being-a-good-clr-host-modernizing-offensive-net-tradecraft)
 - [ECMA-335 — Common Language Infrastructure (CLI)](https://ecma-international.org/publications-and-standards/standards/ecma-335/)
-- [clroxide (upstream)](https://github.com/b4rtik/clroxide)
+- [clroxide (upstream)](https://github.com/yamakadi/clroxide)
