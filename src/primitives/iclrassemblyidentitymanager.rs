@@ -101,7 +101,7 @@ impl ICLRAssemblyIdentityManager {
 
         // HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) = 0x8007007A
         // This is expected - we need to know the buffer size
-        if hr.0 != 0x8007007A && hr.is_err() {
+        if hr.0 != 0x8007007Au32 as i32 && hr.is_err() {
             release_stream(stream_ptr);
             return Err(format!(
                 "GetBindingIdentityFromStream failed (size query): {:?}",

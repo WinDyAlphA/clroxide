@@ -261,7 +261,7 @@ unsafe extern "system" fn memory_stream_query_interface(
     ppvObject: *mut *mut c_void,
 ) -> HRESULT {
     if ppvObject.is_null() {
-        return HRESULT(0x80004003); // E_POINTER
+        return HRESULT(0x80004003u32 as i32); // E_POINTER
     }
 
     let iid = &*riid;
@@ -272,7 +272,7 @@ unsafe extern "system" fn memory_stream_query_interface(
     }
 
     *ppvObject = ptr::null_mut();
-    HRESULT(0x80004002) // E_NOINTERFACE
+    HRESULT(0x80004002u32 as i32) // E_NOINTERFACE
 }
 
 unsafe extern "system" fn memory_stream_add_ref(this: *mut c_void) -> u32 {
@@ -323,7 +323,7 @@ unsafe extern "system" fn memory_stream_write(
     _cb: u32,
     _pcbWritten: *mut u32,
 ) -> HRESULT {
-    HRESULT(0x80004001) // E_NOTIMPL - read-only stream
+    HRESULT(0x80004001u32 as i32) // E_NOTIMPL - read-only stream
 }
 
 // STREAM_SEEK constants
@@ -343,11 +343,11 @@ unsafe extern "system" fn memory_stream_seek(
         STREAM_SEEK_SET => dlibMove,
         STREAM_SEEK_CUR => stream.position as i64 + dlibMove,
         STREAM_SEEK_END => stream.data.len() as i64 + dlibMove,
-        _ => return HRESULT(0x80070057), // E_INVALIDARG
+        _ => return HRESULT(0x80070057u32 as i32), // E_INVALIDARG
     };
 
     if new_pos < 0 || new_pos > stream.data.len() as i64 {
-        return HRESULT(0x80070057); // E_INVALIDARG
+        return HRESULT(0x80070057u32 as i32); // E_INVALIDARG
     }
 
     stream.position = new_pos as usize;
@@ -360,7 +360,7 @@ unsafe extern "system" fn memory_stream_seek(
 }
 
 unsafe extern "system" fn memory_stream_set_size(_this: *mut c_void, _libNewSize: u64) -> HRESULT {
-    HRESULT(0x80004001) // E_NOTIMPL
+    HRESULT(0x80004001u32 as i32) // E_NOTIMPL
 }
 
 unsafe extern "system" fn memory_stream_copy_to(
@@ -370,7 +370,7 @@ unsafe extern "system" fn memory_stream_copy_to(
     _pcbRead: *mut u64,
     _pcbWritten: *mut u64,
 ) -> HRESULT {
-    HRESULT(0x80004001) // E_NOTIMPL
+    HRESULT(0x80004001u32 as i32) // E_NOTIMPL
 }
 
 unsafe extern "system" fn memory_stream_commit(_this: *mut c_void, _grfCommitFlags: u32) -> HRESULT {
@@ -378,7 +378,7 @@ unsafe extern "system" fn memory_stream_commit(_this: *mut c_void, _grfCommitFla
 }
 
 unsafe extern "system" fn memory_stream_revert(_this: *mut c_void) -> HRESULT {
-    HRESULT(0x80004001) // E_NOTIMPL
+    HRESULT(0x80004001u32 as i32) // E_NOTIMPL
 }
 
 unsafe extern "system" fn memory_stream_lock_region(
@@ -387,7 +387,7 @@ unsafe extern "system" fn memory_stream_lock_region(
     _cb: u64,
     _dwLockType: u32,
 ) -> HRESULT {
-    HRESULT(0x80004001) // E_NOTIMPL
+    HRESULT(0x80004001u32 as i32) // E_NOTIMPL
 }
 
 unsafe extern "system" fn memory_stream_unlock_region(
@@ -396,7 +396,7 @@ unsafe extern "system" fn memory_stream_unlock_region(
     _cb: u64,
     _dwLockType: u32,
 ) -> HRESULT {
-    HRESULT(0x80004001) // E_NOTIMPL
+    HRESULT(0x80004001u32 as i32) // E_NOTIMPL
 }
 
 // STATSTG structure for Stat
@@ -423,7 +423,7 @@ unsafe extern "system" fn memory_stream_stat(
     _grfStatFlag: u32,
 ) -> HRESULT {
     if pstatstg.is_null() {
-        return HRESULT(0x80004003); // E_POINTER
+        return HRESULT(0x80004003u32 as i32); // E_POINTER
     }
 
     let stream = &*(this as *mut MemoryStream);
@@ -448,7 +448,7 @@ unsafe extern "system" fn memory_stream_clone(
     _this: *mut c_void,
     _ppstm: *mut *mut c_void,
 ) -> HRESULT {
-    HRESULT(0x80004001) // E_NOTIMPL
+    HRESULT(0x80004001u32 as i32) // E_NOTIMPL
 }
 
 // ============================================================================
@@ -559,7 +559,7 @@ unsafe extern "system" fn host_control_query_interface(
     ppvObject: *mut *mut c_void,
 ) -> HRESULT {
     if ppvObject.is_null() {
-        return HRESULT(0x80004003);
+        return HRESULT(0x80004003u32 as i32);
     }
 
     let iid = &*riid;
@@ -570,7 +570,7 @@ unsafe extern "system" fn host_control_query_interface(
     }
 
     *ppvObject = ptr::null_mut();
-    HRESULT(0x80004002)
+    HRESULT(0x80004002u32 as i32)
 }
 
 unsafe extern "system" fn host_control_add_ref(this: *mut c_void) -> u32 {
@@ -599,7 +599,7 @@ unsafe extern "system" fn host_control_get_host_manager(
     ppObject: *mut *mut c_void,
 ) -> HRESULT {
     if ppObject.is_null() {
-        return HRESULT(0x80004003);
+        return HRESULT(0x80004003u32 as i32);
     }
 
     let iid = &*riid;
@@ -616,7 +616,7 @@ unsafe extern "system" fn host_control_get_host_manager(
 
     // Return E_NOINTERFACE for everything else - CLR will use defaults
     *ppObject = ptr::null_mut();
-    HRESULT(0x80004002)
+    HRESULT(0x80004002u32 as i32)
 }
 
 unsafe extern "system" fn host_control_set_appdomain_manager(
@@ -647,7 +647,7 @@ unsafe extern "system" fn host_assembly_manager_query_interface(
     ppvObject: *mut *mut c_void,
 ) -> HRESULT {
     if ppvObject.is_null() {
-        return HRESULT(0x80004003);
+        return HRESULT(0x80004003u32 as i32);
     }
 
     let iid = &*riid;
@@ -658,7 +658,7 @@ unsafe extern "system" fn host_assembly_manager_query_interface(
     }
 
     *ppvObject = ptr::null_mut();
-    HRESULT(0x80004002)
+    HRESULT(0x80004002u32 as i32)
 }
 
 unsafe extern "system" fn host_assembly_manager_add_ref(this: *mut c_void) -> u32 {
@@ -697,7 +697,7 @@ unsafe extern "system" fn host_assembly_manager_get_assembly_store(
     ppAssemblyStore: *mut *mut c_void,
 ) -> HRESULT {
     if ppAssemblyStore.is_null() {
-        return HRESULT(0x80004003);
+        return HRESULT(0x80004003u32 as i32);
     }
 
     let mgr = &*(this as *mut HostAssemblyManager);
@@ -708,7 +708,7 @@ unsafe extern "system" fn host_assembly_manager_get_assembly_store(
     }
 
     *ppAssemblyStore = ptr::null_mut();
-    HRESULT(0x80004002)
+    HRESULT(0x80004002u32 as i32)
 }
 
 // ============================================================================
@@ -731,7 +731,7 @@ unsafe extern "system" fn host_assembly_store_query_interface(
     ppvObject: *mut *mut c_void,
 ) -> HRESULT {
     if ppvObject.is_null() {
-        return HRESULT(0x80004003);
+        return HRESULT(0x80004003u32 as i32);
     }
 
     let iid = &*riid;
@@ -742,7 +742,7 @@ unsafe extern "system" fn host_assembly_store_query_interface(
     }
 
     *ppvObject = ptr::null_mut();
-    HRESULT(0x80004002)
+    HRESULT(0x80004002u32 as i32)
 }
 
 unsafe extern "system" fn host_assembly_store_add_ref(this: *mut c_void) -> u32 {
@@ -774,7 +774,7 @@ unsafe extern "system" fn host_assembly_store_provide_assembly(
     ppStmPDB: *mut *mut c_void,
 ) -> HRESULT {
     if pBindInfo.is_null() || ppStmAssemblyImage.is_null() {
-        return HRESULT(0x80004003);
+        return HRESULT(0x80004003u32 as i32);
     }
 
     // Initialize output to null
@@ -788,7 +788,7 @@ unsafe extern "system" fn host_assembly_store_provide_assembly(
 
     // Get the assembly identity string
     if bind_info.lpReferencedIdentity.is_null() {
-        return HRESULT(0x80070002); // COR_E_FILENOTFOUND
+        return HRESULT(0x80070002u32 as i32); // COR_E_FILENOTFOUND
     }
 
     // Convert identity to Rust string
@@ -808,7 +808,7 @@ unsafe extern "system" fn host_assembly_store_provide_assembly(
     // Look up in our storage
     let storage = match store.storage.lock() {
         Ok(s) => s,
-        Err(_) => return HRESULT(0x8007000E), // E_OUTOFMEMORY
+        Err(_) => return HRESULT(0x8007000Eu32 as i32), // E_OUTOFMEMORY
     };
 
     match storage.get(&identity) {
@@ -826,7 +826,7 @@ unsafe extern "system" fn host_assembly_store_provide_assembly(
         }
         None => {
             // Not found - return "file not found" so CLR uses normal resolution
-            HRESULT(0x80070002) // COR_E_FILENOTFOUND / HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)
+            HRESULT(0x80070002u32 as i32) // COR_E_FILENOTFOUND / HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)
         }
     }
 }
@@ -839,7 +839,7 @@ unsafe extern "system" fn host_assembly_store_provide_module(
     _ppStmPDB: *mut *mut c_void,
 ) -> HRESULT {
     // We don't provide individual modules, just assemblies
-    HRESULT(0x80070002) // COR_E_FILENOTFOUND
+    HRESULT(0x80070002u32 as i32) // COR_E_FILENOTFOUND
 }
 
 // ============================================================================

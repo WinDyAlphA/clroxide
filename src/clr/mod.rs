@@ -1,6 +1,6 @@
 use crate::primitives::{
-    AmsiBypassLoader, ICLRAssemblyIdentityManager, ICLRMetaHost, ICLRRuntimeHost, ICLRRuntimeInfo,
-    ICorRuntimeHost, _AppDomain, _MethodInfo, empty_variant_array, wrap_method_arguments,
+    AmsiBypassLoader, ICLRMetaHost, ICLRRuntimeHost, ICLRRuntimeInfo, ICorRuntimeHost, _AppDomain,
+    _MethodInfo, empty_variant_array, get_assembly_identity_from_bytes, wrap_method_arguments,
     RuntimeVersion, GUID, HRESULT,
 };
 use std::ffi::c_void;
@@ -177,7 +177,7 @@ impl Clr {
         let assembly = unsafe { (*(&context).app_domain).load_assembly(&self.contents)? };
 
         unsafe { (*assembly).run_entrypoint(&self.arguments)? };
-        
+
         Ok("".to_string())
     }
 
@@ -321,7 +321,10 @@ impl Clr {
         bypass_loader: &mut AmsiBypassLoader,
     ) -> Result<&ClrContext, String> {
         if self.context.is_some() {
-            return Err("Context already initialized. AMSI bypass must be set before runtime starts.".into());
+            return Err(
+                "Context already initialized. AMSI bypass must be set before runtime starts."
+                    .into(),
+            );
         }
 
         let host = self.get_clr_host()?;
@@ -428,32 +431,19 @@ impl Clr {
         self.run_with_amsi_bypass_no_redirect(bypass_loader, &identity)
     }
 
-    /// Extract assembly identity from bytes using ICLRAssemblyIdentityManager
+    /// Extract assembly identity from bytes using direct PE metadata parsing.
     /// Returns something like: "Seatbelt, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null"
+    ///
+    /// This replaces the broken ICLRAssemblyIdentityManager approach which failed with
+    /// HRESULT(0x80040154) REGDB_E_CLASSNOTREG because:
+    ///   1. The CLSID_CLRAssemblyIdentityManager constant was incorrect
+    ///   2. ICLRRuntimeInfo::GetInterface does NOT support ICLRAssemblyIdentityManager
     pub fn get_assembly_identity(&self) -> Result<String, String> {
         if self.contents.is_empty() {
             return Err("No assembly bytes loaded".into());
         }
 
-        // We need to get ICLRAssemblyIdentityManager from the runtime
-        // This requires starting the metadata host first
-        pub type CreateInterface = fn(
-            class_id: *const GUID,
-            interface_id: *const GUID,
-            interface: *mut *mut c_void,
-        ) -> HRESULT;
-
-        let create_interface: CreateInterface =
-            unsafe { std::mem::transmute(self.create_interface) };
-
-        let host: *mut ICLRMetaHost = ICLRMetaHost::new(create_interface)?;
-        let runtime_info = unsafe { (*host).get_first_available_runtime(Some(self.version))? };
-        let identity_manager: *mut ICLRAssemblyIdentityManager =
-            unsafe { (*runtime_info).get_assembly_identity_manager()? };
-
-        let identity = unsafe { (*identity_manager).get_identity_from_bytes(&self.contents)? };
-
-        Ok(identity)
+        get_assembly_identity_from_bytes(&self.contents)
     }
 }
 

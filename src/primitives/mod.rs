@@ -14,6 +14,7 @@ mod imethodinfo;
 mod ipropertyinfo;
 mod itype;
 mod iunknown;
+mod pe_identity;
 mod types;
 
 pub use helpers::*;
@@ -31,6 +32,7 @@ pub use imethodinfo::*;
 pub use ipropertyinfo::*;
 pub use itype::*;
 pub use iunknown::*;
+pub use pe_identity::*;
 pub use types::*;
 
 pub trait Interface: Sized {
