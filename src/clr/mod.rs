@@ -1,7 +1,7 @@
 use crate::primitives::{
     AmsiBypassLoader, ICLRMetaHost, ICLRRuntimeHost, ICLRRuntimeInfo, ICorRuntimeHost, _AppDomain,
-    _MethodInfo, empty_variant_array, get_assembly_identity_from_bytes, wrap_method_arguments,
-    RuntimeVersion, GUID, HRESULT,
+    _MethodInfo, empty_variant_array, get_assembly_identity_from_bytes, unpack_byte_array,
+    wrap_bool_in_variant, wrap_i64_in_variant, wrap_method_arguments, RuntimeVersion, GUID, HRESULT,
 };
 use std::ffi::c_void;
 use windows::Win32::System::Com::VARIANT;
@@ -34,6 +34,83 @@ pub struct OutputContext {
     pub original_stderr: VARIANT,
     pub redirected_stdout: VARIANT,
     pub redirected_stderr: VARIANT,
+}
+
+/// Output redirection context that supports incremental draining.
+///
+/// Returned by [`Clr::redirect_output_streaming`]. Unlike [`OutputContext`]
+/// which buffers everything into a `StringWriter` and exposes the full
+/// content only at the end, this variant uses `MemoryStream` + `StreamWriter`
+/// with `AutoFlush=true` so that writes from the running assembly become
+/// visible immediately and can be consumed via [`Self::drain`].
+///
+/// `drain` and `restore` are safe to call from a thread other than the one
+/// running the assembly — the underlying COM objects are accessed through
+/// the CLR's standard cross-thread marshaling. This is the canonical pattern
+/// for streaming `Console.Out` from a hosted runtime.
+pub struct StreamingOutputContext {
+    set_out: *mut _MethodInfo,
+    set_err: *mut _MethodInfo,
+    to_array: *mut _MethodInfo,
+    set_position: *mut _MethodInfo,
+    set_length: *mut _MethodInfo,
+    memory_stream_instance: VARIANT,
+    original_stdout: VARIANT,
+    original_stderr: VARIANT,
+}
+
+unsafe impl Send for StreamingOutputContext {}
+unsafe impl Sync for StreamingOutputContext {}
+
+impl StreamingOutputContext {
+    /// Returns everything written to stdout/stderr since the last call,
+    /// then clears the underlying memory stream so the next call only
+    /// returns new bytes.
+    ///
+    /// Safe to call concurrently with the assembly running on another
+    /// thread. Returns an empty `Vec` if nothing has been written.
+    pub fn drain(&self) -> Result<Vec<u8>, String> {
+        let result = unsafe {
+            (*self.to_array).invoke_without_args(Some(self.memory_stream_instance.clone()))?
+        };
+
+        // Reset the stream so we don't re-read the same bytes next time.
+        unsafe {
+            (*self.set_position).invoke(
+                wrap_method_arguments(vec![wrap_i64_in_variant(0)])?,
+                Some(self.memory_stream_instance.clone()),
+            )?;
+            (*self.set_length).invoke(
+                wrap_method_arguments(vec![wrap_i64_in_variant(0)])?,
+                Some(self.memory_stream_instance.clone()),
+            )?;
+        }
+
+        let array = unsafe { result.Anonymous.Anonymous.Anonymous.parray };
+        unpack_byte_array(array)
+    }
+
+    /// Restore `Console.Out` and `Console.Error` to their original writers.
+    ///
+    /// IMPORTANT: only call this once you know the assembly is no longer
+    /// writing to the redirected stream. If a runner thread you cannot
+    /// stop is still emitting output (e.g. an aborted long-running job),
+    /// leak this context with [`std::mem::forget`] instead — the orphaned
+    /// writes will land harmlessly in the detached `MemoryStream` and the
+    /// original `Console.Out` remains untouched.
+    pub fn restore(&self) -> Result<(), String> {
+        unsafe {
+            (*self.set_out).invoke(
+                wrap_method_arguments(vec![self.original_stdout.clone()])?,
+                None,
+            )?;
+            (*self.set_err).invoke(
+                wrap_method_arguments(vec![self.original_stderr.clone()])?,
+                None,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 impl Clr {
@@ -261,6 +338,84 @@ impl Clr {
         };
 
         Ok(unsafe { result.Anonymous.Anonymous.Anonymous.bstrVal.to_string() })
+    }
+
+    /// Redirect `Console.Out` and `Console.Error` to a `MemoryStream` whose
+    /// contents can be drained from any thread via the returned
+    /// [`StreamingOutputContext`]. Useful for long-running or interactive
+    /// assemblies (Rubeus monitor, beacon-style payloads) where output must
+    /// be reported incrementally rather than only at completion.
+    ///
+    /// The companion to this is [`Clr::run_with_amsi_bypass_no_redirect`] (or
+    /// any other run variant that does not call [`Clr::redirect_output`]):
+    /// run the assembly on a separate thread while polling
+    /// [`StreamingOutputContext::drain`] from the main thread.
+    ///
+    /// See `examples/streaming_output.rs` for the full pattern.
+    pub fn redirect_output_streaming(&mut self) -> Result<StreamingOutputContext, String> {
+        let context = self.get_context()?;
+        let app_domain = context.app_domain;
+
+        let mscorlib = unsafe { (*app_domain).load_library("mscorlib")? };
+
+        // MemoryStream — backing store we can drain.
+        let memory_stream = unsafe { (*mscorlib).get_type("System.IO.MemoryStream")? };
+        let to_array = unsafe { (*memory_stream).get_method("ToArray")? };
+        let set_position = unsafe { (*memory_stream).get_method("set_Position")? };
+        let set_length = unsafe { (*memory_stream).get_method("SetLength")? };
+        let memory_stream_instance =
+            unsafe { (*mscorlib).create_instance("System.IO.MemoryStream")? };
+
+        // StreamWriter wrapping the MemoryStream, with AutoFlush so each
+        // WriteLine is visible to the polling thread without an explicit Flush.
+        let stream_writer = unsafe { (*mscorlib).get_type("System.IO.StreamWriter")? };
+        let stream_writer_constructor = unsafe {
+            (*stream_writer).get_constructor_with_signature("Void .ctor(System.IO.Stream)")?
+        };
+        let stream_writer_instance = unsafe {
+            (*stream_writer_constructor)
+                .invoke(wrap_method_arguments(vec![memory_stream_instance.clone()])?)?
+        };
+
+        let auto_flush_property = unsafe { (*stream_writer).get_property("AutoFlush")? };
+        unsafe {
+            (*auto_flush_property).set_value(
+                wrap_bool_in_variant(true),
+                Some(stream_writer_instance.clone()),
+            )?;
+        }
+
+        // Save the original Console.Out / Console.Error so we can restore them.
+        let console = unsafe { (*mscorlib).get_type("System.Console")? };
+        let get_out = unsafe { (*console).get_method("get_Out")? };
+        let set_out = unsafe { (*console).get_method("SetOut")? };
+        let get_err = unsafe { (*console).get_method("get_Error")? };
+        let set_err = unsafe { (*console).get_method("SetError")? };
+        let original_stdout = unsafe { (*get_out).invoke_without_args(None)? };
+        let original_stderr = unsafe { (*get_err).invoke_without_args(None)? };
+
+        // Replace stdout and stderr with the auto-flushing StreamWriter.
+        unsafe {
+            (*set_out).invoke(
+                wrap_method_arguments(vec![stream_writer_instance.clone()])?,
+                None,
+            )?;
+            (*set_err).invoke(
+                wrap_method_arguments(vec![stream_writer_instance.clone()])?,
+                None,
+            )?;
+        }
+
+        Ok(StreamingOutputContext {
+            set_out,
+            set_err,
+            to_array,
+            set_position,
+            set_length,
+            memory_stream_instance,
+            original_stdout,
+            original_stderr,
+        })
     }
 
     pub fn get_context(&mut self) -> Result<&ClrContext, String> {
