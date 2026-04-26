@@ -127,6 +127,11 @@ impl AssemblyStorage {
     /// Find an assembly by simple name (case-insensitive, ignores version/culture/etc.)
     /// This is needed because the CLR normalizes identity strings before passing them
     /// to ProvideAssembly, potentially adding fields like `processorArchitecture=MSIL`.
+    ///
+    /// **Do not use this when multiple versions of the same simple name are
+    /// registered concurrently** — `HashMap::iter` order is unspecified, so this
+    /// would return an arbitrary version. Prefer
+    /// [`Self::find_by_name_and_version`] which disambiguates by Version field.
     pub fn find_by_simple_name(&self, simple_name: &str) -> Option<&Vec<u8>> {
         let needle = simple_name.trim().to_lowercase();
         self.assemblies.iter().find_map(|(key, val)| {
@@ -138,6 +143,55 @@ impl AssemblyStorage {
             }
         })
     }
+
+    /// Find an assembly by simple name **and** version. The CLR normalizes
+    /// identity strings before calling `ProvideAssembly` (often appending
+    /// `processorArchitecture=MSIL`), so an exact-string `get` may miss even
+    /// when an entry exists. Falling back to simple-name alone is unsafe when
+    /// multiple versions of the same name are registered (e.g. concurrent
+    /// ExecuteAssembly jobs that rely on per-task version bumps to defeat the
+    /// CLR's identity cache): `HashMap::iter` returns entries in
+    /// unspecified order so the wrong bytes may be served, causing the
+    /// running assembly to land in a previously-loaded AppDomain copy.
+    /// This matches by (simple name, Version=…) which is enough to keep
+    /// distinct concurrent invocations isolated.
+    pub fn find_by_name_and_version(
+        &self,
+        simple_name: &str,
+        version: &str,
+    ) -> Option<&Vec<u8>> {
+        let name_needle = simple_name.trim().to_lowercase();
+        let version_needle = version.trim().to_lowercase();
+        self.assemblies.iter().find_map(|(key, val)| {
+            let stored_simple = key.split(',').next().unwrap_or(key).trim().to_lowercase();
+            if stored_simple != name_needle {
+                return None;
+            }
+            let stored_version = extract_field(key, "version").unwrap_or_default().to_lowercase();
+            if stored_version == version_needle {
+                Some(val)
+            } else {
+                None
+            }
+        })
+    }
+}
+
+/// Extract a `Key=Value` field (case-insensitive on the key) from an
+/// assembly identity string. Returns the value with surrounding whitespace
+/// trimmed, or `None` if the field is absent.
+fn extract_field<'a>(identity: &'a str, key: &str) -> Option<&'a str> {
+    let key_lower = key.to_lowercase();
+    for part in identity.split(',') {
+        let part = part.trim();
+        if let Some(eq) = part.find('=') {
+            let (k, v) = part.split_at(eq);
+            if k.trim().to_lowercase() == key_lower {
+                return Some(v[1..].trim());
+            }
+        }
+    }
+    None
 }
 
 impl Default for AssemblyStorage {
@@ -839,16 +893,28 @@ unsafe extern "system" fn host_assembly_store_provide_assembly(
         Err(_) => return HRESULT(0x8007000Eu32 as i32), // E_OUTOFMEMORY
     };
 
-    // Extract simple name from the CLR-provided identity.
-    // The CLR normalizes identity strings before calling ProvideAssembly, potentially
-    // appending extra fields like `processorArchitecture=MSIL`. We use the simple name
-    // (everything before the first comma) for a robust fallback match.
+    // The CLR normalizes identity strings before calling ProvideAssembly,
+    // potentially appending extra fields like `processorArchitecture=MSIL`.
+    // We try, in order:
+    //   1. Exact string match (fast path; works only when CLR did not
+    //      normalize beyond what we registered).
+    //   2. (simple name, Version=…) match — disambiguates between multiple
+    //      registered versions of the same simple name. This is what makes
+    //      per-task version-bumped assemblies (used to defeat the CLR
+    //      identity cache for concurrent ExecuteAssembly jobs) actually
+    //      route to the right bytes.
+    //   3. Simple-name-only fallback for the common single-version case.
     let clr_simple_name = identity.split(',').next().unwrap_or(&identity).trim();
+    let clr_version = extract_field(&identity, "version");
 
-    // Try exact match first (fast path), then fall back to simple-name match.
-    let found_bytes = storage
-        .get(&identity)
-        .or_else(|| storage.find_by_simple_name(clr_simple_name));
+    let found_bytes = storage.get(&identity).or_else(|| {
+        if let Some(version) = clr_version {
+            if let Some(bytes) = storage.find_by_name_and_version(clr_simple_name, version) {
+                return Some(bytes);
+            }
+        }
+        storage.find_by_simple_name(clr_simple_name)
+    });
 
     match found_bytes {
         Some(bytes) => {
