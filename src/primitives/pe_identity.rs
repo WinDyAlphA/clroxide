@@ -38,6 +38,113 @@ fn read_string(strings_heap: &[u8], offset: usize) -> String {
 /// Returns a string like:
 /// `MyAssembly, Version=1.2.3.4, Culture=neutral, PublicKeyToken=null`
 pub fn get_assembly_identity_from_bytes(data: &[u8]) -> Result<String, String> {
+    let layout = parse_metadata_layout(data)?;
+    let strings = data
+        .get(layout.strings_heap_offset..layout.strings_heap_offset + layout.strings_heap_size)
+        .ok_or("Strings heap out of bounds")?;
+    let blob = data
+        .get(layout.blob_heap_offset..layout.blob_heap_offset + layout.blob_heap_size)
+        .unwrap_or(&[]);
+
+    let row_off = layout.assembly_def_row_offset;
+    let string_idx_size = layout.string_idx_size;
+    let blob_idx_size = layout.blob_idx_size;
+    let string_index_wide = string_idx_size == 4;
+    let blob_index_wide = blob_idx_size == 4;
+
+    let major = read_u16(data, row_off + 4).ok_or("Cannot read MajorVersion")?;
+    let minor = read_u16(data, row_off + 6).ok_or("Cannot read MinorVersion")?;
+    let build = read_u16(data, row_off + 8).ok_or("Cannot read BuildNumber")?;
+    let revision = read_u16(data, row_off + 10).ok_or("Cannot read RevisionNumber")?;
+
+    let pk_offset = row_off + 16;
+    let pk_blob_idx = if blob_index_wide {
+        read_u32(data, pk_offset).ok_or("Cannot read PublicKey blob index")? as usize
+    } else {
+        read_u16(data, pk_offset).ok_or("Cannot read PublicKey blob index")? as usize
+    };
+
+    let name_offset = pk_offset + blob_idx_size;
+    let name_str_idx = if string_index_wide {
+        read_u32(data, name_offset).ok_or("Cannot read Name string index")? as usize
+    } else {
+        read_u16(data, name_offset).ok_or("Cannot read Name string index")? as usize
+    };
+
+    let culture_offset = name_offset + string_idx_size;
+    let culture_str_idx = if string_index_wide {
+        read_u32(data, culture_offset).ok_or("Cannot read Culture string index")? as usize
+    } else {
+        read_u16(data, culture_offset).ok_or("Cannot read Culture string index")? as usize
+    };
+
+    let name = read_string(strings, name_str_idx);
+    let culture_raw = read_string(strings, culture_str_idx);
+    let culture = if culture_raw.is_empty() {
+        "neutral".to_string()
+    } else {
+        culture_raw
+    };
+
+    let public_key_token = get_public_key_token(blob, pk_blob_idx);
+
+    if name.is_empty() || name_str_idx >= strings.len() {
+        return Err(format!(
+            "PE identity parse failed: name index {} is out of range (offset={}). \
+             Assembly table row may be at wrong offset - check table row size calculations.",
+            name_str_idx, row_off
+        ));
+    }
+    if name.contains('\0') || name.chars().any(|c| c < ' ' && c != '\t') {
+        return Err(format!(
+            "PE identity parse failed: assembly name {:?} contains invalid characters. \
+             Table offset calculation may be wrong.",
+            name
+        ));
+    }
+
+    Ok(format!(
+        "{}, Version={}.{}.{}.{}, Culture={}, PublicKeyToken={}",
+        name, major, minor, build, revision, culture, public_key_token
+    ))
+}
+
+/// Overwrite the AssemblyDef BuildNumber and RevisionNumber fields in place.
+///
+/// Forces the CLR's hosted-runtime binder to treat the assembly as a brand-new
+/// identity on every load — necessary when the same assembly bytes need to be
+/// re-executed multiple times in the same process (the binder caches by full
+/// identity, and cached assemblies retain their static state from the prior
+/// `Main()` invocation, which breaks run-once entrypoints).
+pub fn patch_assembly_version(
+    data: &mut [u8],
+    build: u16,
+    revision: u16,
+) -> Result<(), String> {
+    let layout = parse_metadata_layout(data)?;
+    let row_off = layout.assembly_def_row_offset;
+    if row_off + 12 > data.len() {
+        return Err("AssemblyDef row truncated".into());
+    }
+    data[row_off + 8..row_off + 10].copy_from_slice(&build.to_le_bytes());
+    data[row_off + 10..row_off + 12].copy_from_slice(&revision.to_le_bytes());
+    Ok(())
+}
+
+/// Result of walking the PE / CLI metadata up to the first `AssemblyDef`
+/// row. Holds only byte offsets into the source data so the same helper
+/// can drive both read-only identity extraction and in-place patching.
+struct MetadataLayout {
+    assembly_def_row_offset: usize,
+    string_idx_size: usize,
+    blob_idx_size: usize,
+    strings_heap_offset: usize,
+    strings_heap_size: usize,
+    blob_heap_offset: usize,
+    blob_heap_size: usize,
+}
+
+fn parse_metadata_layout(data: &[u8]) -> Result<MetadataLayout, String> {
     // --- Step 1: DOS header → PE offset ---
     if data.len() < 64 {
         return Err("PE too small for DOS header".into());
@@ -54,7 +161,7 @@ pub fn get_assembly_identity_from_bytes(data: &[u8]) -> Result<String, String> {
 
     // --- Step 3: Optional Header ---
     let coff_offset = pe_offset + 4;
-    let machine = read_u16(data, coff_offset).ok_or("Cannot read Machine")?;
+    let _machine = read_u16(data, coff_offset).ok_or("Cannot read Machine")?;
     let num_sections = read_u16(data, coff_offset + 2).ok_or("Cannot read NumSections")? as usize;
     let opt_header_size =
         read_u16(data, coff_offset + 16).ok_or("Cannot read OptHeaderSize")? as usize;
@@ -118,10 +225,9 @@ pub fn get_assembly_identity_from_bytes(data: &[u8]) -> Result<String, String> {
 
     // --- Step 7: Locate streams (#~, #Strings, #Blob, #US) ---
     let mut stream_header_offset = flags_offset + 4;
-    let mut tables_rva: Option<u32> = None;
     let mut tables_stream_offset: Option<usize> = None;
-    let mut strings_heap: Option<&[u8]> = None;
-    let mut blob_heap: Option<&[u8]> = None;
+    let mut strings_heap: Option<(usize, usize)> = None;
+    let mut blob_heap: Option<(usize, usize)> = None;
 
     for _ in 0..num_streams {
         let stream_offset =
@@ -142,16 +248,9 @@ pub fn get_assembly_identity_from_bytes(data: &[u8]) -> Result<String, String> {
         let abs_offset = meta_offset + stream_offset;
 
         match name {
-            "#~" | "#-" => {
-                tables_stream_offset = Some(abs_offset);
-                let _ = tables_rva;
-            },
-            "#Strings" => {
-                strings_heap = data.get(abs_offset..abs_offset + stream_size);
-            },
-            "#Blob" => {
-                blob_heap = data.get(abs_offset..abs_offset + stream_size);
-            },
+            "#~" | "#-" => tables_stream_offset = Some(abs_offset),
+            "#Strings" => strings_heap = Some((abs_offset, stream_size)),
+            "#Blob" => blob_heap = Some((abs_offset, stream_size)),
             _ => {},
         }
 
@@ -159,8 +258,9 @@ pub fn get_assembly_identity_from_bytes(data: &[u8]) -> Result<String, String> {
     }
 
     let tables_off = tables_stream_offset.ok_or("No #~ stream found")?;
-    let strings = strings_heap.ok_or("No #Strings heap found")?;
-    let blob = blob_heap.unwrap_or(&[]);
+    let (strings_heap_offset, strings_heap_size) =
+        strings_heap.ok_or("No #Strings heap found")?;
+    let (blob_heap_offset, blob_heap_size) = blob_heap.unwrap_or((0, 0));
 
     // --- Step 8: Parse #~ stream header ---
     // Offset 0: Reserved (4)
@@ -176,13 +276,9 @@ pub fn get_assembly_identity_from_bytes(data: &[u8]) -> Result<String, String> {
         .get(tables_off + 6)
         .copied()
         .ok_or("Cannot read HeapSizes")?;
-    let string_index_wide = (heap_sizes & 0x01) != 0; // 4-byte string index if set
-    let guid_index_wide = (heap_sizes & 0x02) != 0;
-    let blob_index_wide = (heap_sizes & 0x04) != 0;
-
-    let string_idx_size: usize = if string_index_wide { 4 } else { 2 };
-    let guid_idx_size: usize = if guid_index_wide { 4 } else { 2 };
-    let blob_idx_size: usize = if blob_index_wide { 4 } else { 2 };
+    let string_idx_size: usize = if heap_sizes & 0x01 != 0 { 4 } else { 2 };
+    let guid_idx_size: usize = if heap_sizes & 0x02 != 0 { 4 } else { 2 };
+    let blob_idx_size: usize = if heap_sizes & 0x04 != 0 { 4 } else { 2 };
 
     let valid_mask = {
         let b = data
@@ -203,57 +299,21 @@ pub fn get_assembly_identity_from_bytes(data: &[u8]) -> Result<String, String> {
     }
 
     // --- Step 9: Calculate table row sizes and find AssemblyDef (table 0x20 = 32) ---
-    // Table 0x20 = Assembly
-    // Row layout:
-    //   HashAlgId (4)
-    //   MajorVersion (2), MinorVersion (2), BuildNumber (2), RevisionNumber (2)
-    //   Flags (4)
-    //   PublicKey (blob index)
-    //   Name (string index)
-    //   Culture (string index)
     const ASSEMBLY_TABLE: usize = 0x20;
 
     if row_counts[ASSEMBLY_TABLE] == 0 {
         return Err("No AssemblyDef table (not an assembly?)".into());
     }
 
-    // We need to skip all tables before 0x20 to find the row data offset.
-    // First, calculate the size of each table's rows.
-    let table_row_size = |table: usize| -> Result<usize, String> {
-        // This is complex in general; we implement only what we need.
-        // Use a simpler approach: we count only known fixed tables we need to skip.
-        // A full implementation would need all 45+ table schemas.
-        // For our purposes we implement just enough to reach AssemblyDef.
-        Ok(match table {
-            0x00 => 2 + guid_idx_size,                   // Module
-            0x01 => string_idx_size + blob_idx_size + 2, // TypeRef (ResolutionScope coded + Name + Namespace)
-            // TypeRef ResolutionScope is a coded index (2 or 4 bytes)
-            // Let's use coded index size = 2 for now
-            _ => return Err(format!("Unknown table 0x{:02X} row size needed", table)),
-        })
-    };
-
-    // We'll use a simpler approach: since AssemblyDef is usually near the start,
-    // we calculate total bytes to skip for tables 0..0x1F
-    //
-    // The table data starts after the row counts in the stream header.
-    // We implement table schemas for all tables 0x00-0x1F that can be present.
-    //
-    // Coded index sizes depend on row counts of referenced tables.
-    // We implement a simplified but accurate version.
-
-    // Helper: coded index size (2 if max referenced table has <= 2^(16-tag_bits) rows, else 4)
+    // Coded index size: 2 if max referenced table has < 2^(16-tag_bits) rows, else 4.
     let coded_idx_size = |tables: &[usize], tag_bits: u32| -> usize {
-        let threshold = (1u32 << (16 - tag_bits)) as u32;
-        let needs_4 = tables.iter().any(|&t| row_counts[t] >= threshold);
-        if needs_4 {
+        let threshold = 1u32 << (16 - tag_bits);
+        if tables.iter().any(|&t| row_counts[t] >= threshold) {
             4
         } else {
             2
         }
     };
-
-    // Simple table index size
     let tbl_idx = |t: usize| -> usize {
         if row_counts[t] >= 65536 {
             4
@@ -263,16 +323,12 @@ pub fn get_assembly_identity_from_bytes(data: &[u8]) -> Result<String, String> {
     };
 
     // Coded index types (II.24.2.6 of ECMA-335)
-    let ci_type_def_or_ref = coded_idx_size(&[0x00, 0x01, 0x1B], 2); // TypeDefOrRef
-    let ci_has_constant = coded_idx_size(&[0x04, 0x08, 0x17], 2); // HasConstant
+    let ci_type_def_or_ref = coded_idx_size(&[0x00, 0x01, 0x1B], 2);
+    let ci_has_constant = coded_idx_size(&[0x04, 0x08, 0x17], 2);
     let ci_has_cattr = coded_idx_size(
         &[
-            0x06, 0x04, 0x01, 0x02, 0x08, 0x09, 0x0A,
-            0x00, // MethodDef, Field, TypeRef, TypeDef, Param, InterfaceImpl, MemberRef, Module
-            0x0E, 0x17, 0x14, 0x11, 0x1A,
-            0x1B, // DeclSecurity, Property, Event, StandAloneSig, ModuleRef, TypeSpec
-            0x20, 0x23, 0x26, 0x27, 0x28, 0x2A, 0x2C,
-            0x2B, // Assembly, AssemblyRef, File, ExportedType, ManifestResource, GenericParam, GenericParamConstraint, MethodSpec
+            0x06, 0x04, 0x01, 0x02, 0x08, 0x09, 0x0A, 0x00, 0x0E, 0x17, 0x14, 0x11, 0x1A, 0x1B,
+            0x20, 0x23, 0x26, 0x27, 0x28, 0x2A, 0x2C, 0x2B,
         ],
         5,
     );
@@ -282,18 +338,14 @@ pub fn get_assembly_identity_from_bytes(data: &[u8]) -> Result<String, String> {
     let ci_has_semantics = coded_idx_size(&[0x14, 0x17], 1);
     let ci_method_def_or_ref = coded_idx_size(&[0x06, 0x0A], 1);
     let ci_member_forwarded = coded_idx_size(&[0x04, 0x06], 1);
-    let ci_implementation = coded_idx_size(&[0x26, 0x23, 0x27], 2);
-    let ci_cattr_type = coded_idx_size(&[0x06, 0x0A], 3); // CustomAttributeType: MethodDef or MemberRef only
+    let ci_cattr_type = coded_idx_size(&[0x06, 0x0A], 3);
     let ci_resolution_scope = coded_idx_size(&[0x00, 0x1A, 0x23, 0x01], 2);
-    let ci_type_or_method_def = coded_idx_size(&[0x02, 0x06], 1);
 
-    // Row sizes for tables 0x00 through 0x1F
     let row_size: [usize; 0x20] = [
-        /* 0x00 Module            */
-        2 + string_idx_size + guid_idx_size + guid_idx_size + guid_idx_size,
-        /* 0x01 TypeRef           */ ci_resolution_scope + string_idx_size + string_idx_size,
+        /* 0x00 Module            */ 2 + string_idx_size + guid_idx_size * 3,
+        /* 0x01 TypeRef           */ ci_resolution_scope + string_idx_size * 2,
         /* 0x02 TypeDef           */
-        4 + string_idx_size + string_idx_size + ci_type_def_or_ref + tbl_idx(0x04) + tbl_idx(0x06),
+        4 + string_idx_size * 2 + ci_type_def_or_ref + tbl_idx(0x04) + tbl_idx(0x06),
         /* 0x03 FieldPtr          */ tbl_idx(0x04),
         /* 0x04 Field             */ 2 + string_idx_size + blob_idx_size,
         /* 0x05 MethodPtr         */ tbl_idx(0x06),
@@ -303,8 +355,7 @@ pub fn get_assembly_identity_from_bytes(data: &[u8]) -> Result<String, String> {
         /* 0x08 Param             */ 2 + 2 + string_idx_size,
         /* 0x09 InterfaceImpl     */ tbl_idx(0x02) + ci_type_def_or_ref,
         /* 0x0A MemberRef         */ ci_member_ref_parent + string_idx_size + blob_idx_size,
-        /* 0x0B Constant          */
-        2 + ci_has_constant + blob_idx_size, // Type(1)+Pad(1), Parent, Value
+        /* 0x0B Constant          */ 2 + ci_has_constant + blob_idx_size,
         /* 0x0C CustomAttribute   */ ci_has_cattr + ci_cattr_type + blob_idx_size,
         /* 0x0D FieldMarshal      */ ci_has_field_marshal + blob_idx_size,
         /* 0x0E DeclSecurity      */ 2 + ci_has_decl_security + blob_idx_size,
@@ -329,98 +380,22 @@ pub fn get_assembly_identity_from_bytes(data: &[u8]) -> Result<String, String> {
         /* 0x1F ENCMap            */ 4,
     ];
 
-    // Skip tables 0..0x1F
-    let mut data_off = rc_offset; // after all row counts
+    let mut data_off = rc_offset;
     for t in 0..ASSEMBLY_TABLE {
         if valid_mask & (1 << t) != 0 {
-            let rows = row_counts[t] as usize;
-            let size = row_size[t];
-            data_off += rows * size;
+            data_off += row_counts[t] as usize * row_size[t];
         }
     }
 
-    // --- Step 10: Read AssemblyDef row (first and only row) ---
-    // Assembly table row layout (ECMA-335 II.22.2):
-    //   HashAlgId : 4
-    //   MajorVersion : 2
-    //   MinorVersion : 2
-    //   BuildNumber : 2
-    //   RevisionNumber : 2
-    //   Flags : 4
-    //   PublicKey : BlobIndex
-    //   Name : StringIndex
-    //   Culture : StringIndex
-
-    let row_off = data_off;
-    let hash_alg_id = read_u32(data, row_off).ok_or("Cannot read HashAlgId")?;
-    let _ = hash_alg_id;
-
-    let major = read_u16(data, row_off + 4).ok_or("Cannot read MajorVersion")?;
-    let minor = read_u16(data, row_off + 6).ok_or("Cannot read MinorVersion")?;
-    let build = read_u16(data, row_off + 8).ok_or("Cannot read BuildNumber")?;
-    let revision = read_u16(data, row_off + 10).ok_or("Cannot read RevisionNumber")?;
-    // Flags (4 bytes)
-    let _flags = read_u32(data, row_off + 12).ok_or("Cannot read Flags")?;
-
-    let pk_offset = row_off + 16;
-    let pk_blob_idx = if blob_index_wide {
-        read_u32(data, pk_offset).ok_or("Cannot read PublicKey blob index")? as usize
-    } else {
-        read_u16(data, pk_offset).ok_or("Cannot read PublicKey blob index")? as usize
-    };
-
-    let name_offset = pk_offset + blob_idx_size;
-    let name_str_idx = if string_index_wide {
-        read_u32(data, name_offset).ok_or("Cannot read Name string index")? as usize
-    } else {
-        read_u16(data, name_offset).ok_or("Cannot read Name string index")? as usize
-    };
-
-    let culture_offset = name_offset + string_idx_size;
-    let culture_str_idx = if string_index_wide {
-        read_u32(data, culture_offset).ok_or("Cannot read Culture string index")? as usize
-    } else {
-        read_u16(data, culture_offset).ok_or("Cannot read Culture string index")? as usize
-    };
-
-    // --- Step 11: Resolve name and culture strings ---
-    let name = read_string(strings, name_str_idx);
-    let culture_raw = read_string(strings, culture_str_idx);
-    let culture = if culture_raw.is_empty() {
-        "neutral".to_string()
-    } else {
-        culture_raw
-    };
-
-    // --- Step 12: Resolve public key token ---
-    // If PublicKey blob is empty (index points to 0-size blob) → "null"
-    // Otherwise compute SHA1 of key, take last 8 bytes reversed → hex token
-    let public_key_token = get_public_key_token(blob, pk_blob_idx);
-
-    // --- Sanity check: validate the parsed result ---
-    // If version numbers are garbage (> 65534 is impossible for real assemblies),
-    // or the name contains non-printable chars, return a diagnostic error.
-    if name.is_empty() || name_str_idx >= strings.len() {
-        return Err(format!(
-            "PE identity parse failed: name index {} is out of range (offset={}). \
-             Assembly table row may be at wrong offset - check table row size calculations.",
-            name_str_idx, row_off
-        ));
-    }
-    if name.contains('\0') || name.chars().any(|c| c < ' ' && c != '\t') {
-        return Err(format!(
-            "PE identity parse failed: assembly name {:?} contains invalid characters. \
-             Table offset calculation may be wrong.",
-            name
-        ));
-    }
-
-    let identity = format!(
-        "{}, Version={}.{}.{}.{}, Culture={}, PublicKeyToken={}",
-        name, major, minor, build, revision, culture, public_key_token
-    );
-
-    Ok(identity)
+    Ok(MetadataLayout {
+        assembly_def_row_offset: data_off,
+        string_idx_size,
+        blob_idx_size,
+        strings_heap_offset,
+        strings_heap_size,
+        blob_heap_offset,
+        blob_heap_size,
+    })
 }
 
 /// Get the public key token from the blob heap.
