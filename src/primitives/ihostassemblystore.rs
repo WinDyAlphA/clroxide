@@ -907,14 +907,39 @@ unsafe extern "system" fn host_assembly_store_provide_assembly(
     let clr_simple_name = identity.split(',').next().unwrap_or(&identity).trim();
     let clr_version = extract_field(&identity, "version");
 
-    let found_bytes = storage.get(&identity).or_else(|| {
-        if let Some(version) = clr_version {
-            if let Some(bytes) = storage.find_by_name_and_version(clr_simple_name, version) {
-                return Some(bytes);
+    eprintln!(
+        "[clroxide] ProvideAssembly query: identity={:?} simple={:?} version={:?} registered={:?}",
+        identity,
+        clr_simple_name,
+        clr_version,
+        storage.assemblies.keys().collect::<Vec<_>>()
+    );
+
+    let mut path = "miss";
+    let found_bytes = storage
+        .get(&identity)
+        .map(|b| {
+            path = "exact";
+            b
+        })
+        .or_else(|| {
+            if let Some(version) = clr_version {
+                if let Some(bytes) = storage.find_by_name_and_version(clr_simple_name, version) {
+                    path = "name+version";
+                    return Some(bytes);
+                }
             }
-        }
-        storage.find_by_simple_name(clr_simple_name)
-    });
+            storage.find_by_simple_name(clr_simple_name).map(|b| {
+                path = "simple-name";
+                b
+            })
+        });
+
+    eprintln!(
+        "[clroxide] ProvideAssembly resolved: path={} found={}",
+        path,
+        found_bytes.is_some()
+    );
 
     match found_bytes {
         Some(bytes) => {
