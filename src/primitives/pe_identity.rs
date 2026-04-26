@@ -131,6 +131,73 @@ pub fn patch_assembly_version(
     Ok(())
 }
 
+/// Overwrite the AssemblyDef Name string in the #Strings heap with a same-length
+/// nonce-derived name, returning the patched simple name.
+///
+/// Defeats the CLR binder's simple-name unification of unsigned
+/// (`PublicKeyToken=null`) assemblies across AppDomains. Without strong-naming,
+/// the binder of a freshly-created AD will reuse a previously-loaded assembly
+/// that shares the same simple name, retaining its static state from the prior
+/// `Main()` invocation (and its `Console.Out` redirect from another AD).
+/// Bumping `(Build, Revision)` is *not* enough because the host store is
+/// queried with `Version=0.0.0.0` regardless of the patched version.
+///
+/// Strategy: in-place same-length overwrite. The first original byte is kept
+/// (so the name remains a valid identifier-style token), the rest is filled
+/// with bytes cycled from `format!("{:08x}", nonce)`. Caller should pass a
+/// process-unique counter as `nonce`.
+///
+/// The name is restricted to a single null-terminated entry in the heap so we
+/// only mutate bytes the AssemblyDef row actually owns.
+pub fn patch_assembly_simple_name(data: &mut [u8], nonce: u32) -> Result<String, String> {
+    let layout = parse_metadata_layout(data)?;
+    let row_off = layout.assembly_def_row_offset;
+    let string_idx_size = layout.string_idx_size;
+
+    // AssemblyDef row: HashAlg(4) Maj(2) Min(2) Build(2) Rev(2) Flags(4) PublicKey(blob_idx) Name(string_idx) ...
+    let name_idx_offset = row_off + 16 + layout.blob_idx_size;
+    let name_str_idx = if string_idx_size == 4 {
+        read_u32(data, name_idx_offset).ok_or("Cannot read Name string index")? as usize
+    } else {
+        read_u16(data, name_idx_offset).ok_or("Cannot read Name string index")? as usize
+    };
+
+    if name_str_idx == 0 || name_str_idx >= layout.strings_heap_size {
+        return Err(format!(
+            "AssemblyDef.Name string index {} out of range (heap size {})",
+            name_str_idx, layout.strings_heap_size
+        ));
+    }
+
+    let abs_name_offset = layout.strings_heap_offset + name_str_idx;
+    let heap_end = layout.strings_heap_offset + layout.strings_heap_size;
+
+    let mut name_end = abs_name_offset;
+    while name_end < heap_end && data[name_end] != 0 {
+        name_end += 1;
+    }
+    if name_end >= heap_end {
+        return Err("AssemblyDef.Name not null-terminated within #Strings heap".into());
+    }
+    let original_len = name_end - abs_name_offset;
+    if original_len == 0 {
+        return Err("AssemblyDef.Name is empty".into());
+    }
+
+    let original_first = data[abs_name_offset];
+    let nonce_hex = format!("{:08x}", nonce);
+    let mut new_name = Vec::with_capacity(original_len);
+    new_name.push(original_first);
+    let mut hex_iter = nonce_hex.bytes().cycle();
+    while new_name.len() < original_len {
+        new_name.push(hex_iter.next().unwrap());
+    }
+
+    data[abs_name_offset..abs_name_offset + original_len].copy_from_slice(&new_name);
+
+    Ok(String::from_utf8_lossy(&new_name).into_owned())
+}
+
 /// Result of walking the PE / CLI metadata up to the first `AssemblyDef`
 /// row. Holds only byte offsets into the source data so the same helper
 /// can drive both read-only identity extraction and in-place patching.
