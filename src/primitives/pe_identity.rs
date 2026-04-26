@@ -131,6 +131,55 @@ pub fn patch_assembly_version(
     Ok(())
 }
 
+/// Overwrite the Module table's Mvid (Module Version Id) GUID in place with a
+/// nonce-derived value.
+///
+/// The Mvid is a per-build GUID embedded by the compiler that the CLR uses to
+/// dedupe assemblies process-wide. When the *same* compiled bytes are loaded
+/// into two different AppDomains under different simple names (as we do for
+/// repeat ExecuteAssembly invocations), the binder of the second AD sees a
+/// pre-existing assembly with the same Mvid loaded under the first name and
+/// fails the load with `FUSION_E_REF_DEF_MISMATCH (0x80131040)` because the
+/// requested name no longer matches the cached entry's name.
+///
+/// Patching the Mvid forces the CLR to treat each task's bytes as a freshly
+/// compiled assembly, so the binder cache lookup misses and a clean load
+/// proceeds.
+///
+/// The new GUID is `nonce` repeated four times (16 bytes) — uniqueness within
+/// the host process is the only requirement.
+pub fn patch_module_mvid(data: &mut [u8], nonce: u32) -> Result<(), String> {
+    let layout = parse_metadata_layout(data)?;
+    if layout.guid_heap_size == 0 {
+        return Err("No #GUID heap — cannot patch Mvid".into());
+    }
+
+    // Module row layout: Generation(2) Name(string_idx) Mvid(guid_idx) EncId(guid_idx) EncBaseId(guid_idx)
+    let mvid_idx_offset = layout.module_row_offset + 2 + layout.string_idx_size;
+    let mvid_idx = if layout.guid_idx_size == 4 {
+        read_u32(data, mvid_idx_offset).ok_or("Cannot read Mvid index")? as usize
+    } else {
+        read_u16(data, mvid_idx_offset).ok_or("Cannot read Mvid index")? as usize
+    };
+    if mvid_idx == 0 {
+        return Err("Mvid index is 0 (no GUID assigned)".into());
+    }
+
+    // #GUID heap is 1-indexed, each entry is 16 bytes.
+    let guid_offset = layout.guid_heap_offset + (mvid_idx - 1) * 16;
+    if guid_offset + 16 > layout.guid_heap_offset + layout.guid_heap_size {
+        return Err("Mvid GUID offset out of #GUID heap bounds".into());
+    }
+
+    let n = nonce.to_le_bytes();
+    let new_guid = [
+        n[0], n[1], n[2], n[3], n[0], n[1], n[2], n[3], n[0], n[1], n[2], n[3], n[0], n[1], n[2],
+        n[3],
+    ];
+    data[guid_offset..guid_offset + 16].copy_from_slice(&new_guid);
+    Ok(())
+}
+
 /// Overwrite the AssemblyDef Name string in the #Strings heap with a same-length
 /// nonce-derived name, returning the patched simple name.
 ///
@@ -208,12 +257,16 @@ pub fn patch_assembly_simple_name(data: &mut [u8], nonce: u32) -> Result<String,
 /// can drive both read-only identity extraction and in-place patching.
 struct MetadataLayout {
     assembly_def_row_offset: usize,
+    module_row_offset: usize,
     string_idx_size: usize,
     blob_idx_size: usize,
+    guid_idx_size: usize,
     strings_heap_offset: usize,
     strings_heap_size: usize,
     blob_heap_offset: usize,
     blob_heap_size: usize,
+    guid_heap_offset: usize,
+    guid_heap_size: usize,
 }
 
 fn parse_metadata_layout(data: &[u8]) -> Result<MetadataLayout, String> {
@@ -300,6 +353,7 @@ fn parse_metadata_layout(data: &[u8]) -> Result<MetadataLayout, String> {
     let mut tables_stream_offset: Option<usize> = None;
     let mut strings_heap: Option<(usize, usize)> = None;
     let mut blob_heap: Option<(usize, usize)> = None;
+    let mut guid_heap: Option<(usize, usize)> = None;
 
     for _ in 0..num_streams {
         let stream_offset =
@@ -323,6 +377,7 @@ fn parse_metadata_layout(data: &[u8]) -> Result<MetadataLayout, String> {
             "#~" | "#-" => tables_stream_offset = Some(abs_offset),
             "#Strings" => strings_heap = Some((abs_offset, stream_size)),
             "#Blob" => blob_heap = Some((abs_offset, stream_size)),
+            "#GUID" => guid_heap = Some((abs_offset, stream_size)),
             _ => {},
         }
 
@@ -333,6 +388,7 @@ fn parse_metadata_layout(data: &[u8]) -> Result<MetadataLayout, String> {
     let (strings_heap_offset, strings_heap_size) =
         strings_heap.ok_or("No #Strings heap found")?;
     let (blob_heap_offset, blob_heap_size) = blob_heap.unwrap_or((0, 0));
+    let (guid_heap_offset, guid_heap_size) = guid_heap.unwrap_or((0, 0));
 
     // --- Step 8: Parse #~ stream header ---
     // Offset 0: Reserved (4)
@@ -452,6 +508,10 @@ fn parse_metadata_layout(data: &[u8]) -> Result<MetadataLayout, String> {
         /* 0x1F ENCMap            */ 4,
     ];
 
+    // Module table (0x00) is always the first table when present and has
+    // exactly one row. Capture its offset for Mvid patching.
+    let module_row_offset = rc_offset;
+
     let mut data_off = rc_offset;
     for t in 0..ASSEMBLY_TABLE {
         if valid_mask & (1 << t) != 0 {
@@ -461,12 +521,16 @@ fn parse_metadata_layout(data: &[u8]) -> Result<MetadataLayout, String> {
 
     Ok(MetadataLayout {
         assembly_def_row_offset: data_off,
+        module_row_offset,
         string_idx_size,
         blob_idx_size,
+        guid_idx_size,
         strings_heap_offset,
         strings_heap_size,
         blob_heap_offset,
         blob_heap_size,
+        guid_heap_offset,
+        guid_heap_size,
     })
 }
 
