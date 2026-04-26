@@ -184,8 +184,13 @@ pub fn patch_assembly_simple_name(data: &mut [u8], nonce: u32) -> Result<String,
         return Err("AssemblyDef.Name is empty".into());
     }
 
+    // Encode the nonce LSB-first so the *prefix* of the new name varies for
+    // every counter — `format!("{:08x}", n)` left-pads with zeros, so the
+    // first hex chars are constant for small counters and distinct names
+    // would still collide on their leading bytes (which is all that fits
+    // when the original name is short).
     let original_first = data[abs_name_offset];
-    let nonce_hex = format!("{:08x}", nonce);
+    let nonce_hex: String = format!("{:08x}", nonce).chars().rev().collect();
     let mut new_name = Vec::with_capacity(original_len);
     new_name.push(original_first);
     let mut hex_iter = nonce_hex.bytes().cycle();
